@@ -1,0 +1,140 @@
+# sub2api 本体。镜像 sub2api:local 由 `./make kind up` / `./make kind reload`
+# 在本地构建后 `kind load` 进节点，所以 imagePullPolicy 必须是 Never。
+# 首次启动走 AUTO_SETUP：建表 + 创建管理员；/app/data 用 emptyDir，
+# 每次重启都会按环境变量重新生成 config.yaml（管理员已存在时自动跳过）。
+#
+# 额外环境变量：写到 deploy/kind/sub2api.env.local（KEY=VALUE，已被 gitignore），
+# tools/mk 会把它同步成 ConfigMap sub2api-extra-env。它在 envFrom 里排在
+# sub2api-defaults 后面，同名变量以它为准；但覆盖不了 env 里来自 Secret 的变量
+# （Kubernetes 中 env 优先于 envFrom）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sub2api-defaults
+  namespace: sub2api
+data:
+  AUTO_SETUP: "true"
+  SERVER_HOST: "0.0.0.0"
+  SERVER_PORT: "8080"
+  SERVER_MODE: release
+  TZ: Asia/Shanghai
+  DATABASE_HOST: postgres
+  DATABASE_PORT: "5432"
+  DATABASE_USER: sub2api
+  DATABASE_DBNAME: sub2api
+  DATABASE_SSLMODE: disable
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  # 本地测试常连 127.0.0.1 / 内网 mock 上游
+  SECURITY_URL_ALLOWLIST_ENABLED: "false"
+  SECURITY_URL_ALLOWLIST_ALLOW_INSECURE_HTTP: "true"
+  SECURITY_URL_ALLOWLIST_ALLOW_PRIVATE_HOSTS: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sub2api
+  namespace: sub2api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sub2api
+  template:
+    metadata:
+      labels:
+        app: sub2api
+    spec:
+      containers:
+        - name: sub2api
+          image: sub2api:local
+          imagePullPolicy: Never
+          env:
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sub2api-secret
+                  key: POSTGRES_PASSWORD
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sub2api-secret
+                  key: REDIS_PASSWORD
+            - name: ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: sub2api-secret
+                  key: ADMIN_EMAIL
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sub2api-secret
+                  key: ADMIN_PASSWORD
+            # 固定 JWT / TOTP 密钥，reload 后登录态和 2FA 不失效
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sub2api-secret
+                  key: JWT_SECRET
+            - name: TOTP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sub2api-secret
+                  key: TOTP_ENCRYPTION_KEY
+          # 后面的来源覆盖前面的同名变量：sub2api.env.local 优先于默认值
+          envFrom:
+            - configMapRef:
+                name: sub2api-defaults
+            - configMapRef:
+                name: sub2api-extra-env
+                optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sub2api
+  namespace: sub2api
+spec:
+  type: NodePort
+  selector:
+    app: sub2api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      # 与 kind-config.yaml 的 extraPortMappings.containerPort 对应
+      nodePort: 30080
